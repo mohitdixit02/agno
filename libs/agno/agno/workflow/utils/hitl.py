@@ -337,12 +337,7 @@ def check_timeout(step_requirement: "StepRequirement") -> Optional[str]:
     Returns:
         The on_timeout action string ("cancel", "skip", "approve") if timed out, None otherwise.
     """
-    if step_requirement.timeout_at is None:
-        return None
-
-    from datetime import datetime, timezone
-
-    if datetime.now(timezone.utc) >= step_requirement.timeout_at:
+    if step_requirement.is_timed_out:
         return step_requirement.on_timeout
     return None
 

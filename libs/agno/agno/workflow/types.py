@@ -1042,6 +1042,8 @@ class StepRequirement:
     @property
     def is_timed_out(self) -> bool:
         """Check if this requirement has exceeded its timeout."""
+        if self.is_resolved:
+            return False
         if self.timeout_at is None:
             return False
         return datetime.now(timezone.utc) >= self.timeout_at

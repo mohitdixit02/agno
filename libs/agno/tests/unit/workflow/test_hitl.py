@@ -214,6 +214,49 @@ class TestStepRequirement:
         assert restored.user_input == original.user_input
         assert restored.on_reject == original.on_reject
 
+    def test_step_requirement_is_timed_out_and_check_timeout(self):
+        """Test is_timed_out property and check_timeout logic for resolved vs unresolved requirements."""
+        from datetime import datetime, timedelta, timezone
+        from agno.workflow.types import OnTimeout
+        from agno.workflow.utils.hitl import check_timeout
+
+        past = datetime.now(timezone.utc) - timedelta(seconds=10)
+        future = datetime.now(timezone.utc) + timedelta(seconds=10)
+
+        # 1. No timeout set -> not timed out
+        req = StepRequirement(step_id="s1", step_name="step1", requires_confirmation=True)
+        assert not req.is_timed_out
+        assert check_timeout(req) is None
+
+        # 2. Timeout in future -> not timed out
+        req_future = StepRequirement(
+            step_id="s1", step_name="step1", requires_confirmation=True, timeout_at=future
+        )
+        assert not req_future.is_timed_out
+        assert check_timeout(req_future) is None
+
+        # 3. Timeout in past and unresolved -> timed out
+        req_past = StepRequirement(
+            step_id="s1", step_name="step1", requires_confirmation=True, timeout_at=past
+        )
+        assert req_past.is_timed_out
+        assert check_timeout(req_past) == OnTimeout.cancel
+
+        # 4. Timeout in past, but rejected (resolved) -> not timed out
+        req_past.reject()
+        assert req_past.is_resolved
+        assert not req_past.is_timed_out
+        assert check_timeout(req_past) is None
+
+        # 5. Timeout in past, but confirmed (resolved) -> not timed out
+        req_past2 = StepRequirement(
+            step_id="s1", step_name="step1", requires_confirmation=True, timeout_at=past
+        )
+        req_past2.confirm()
+        assert req_past2.is_resolved
+        assert not req_past2.is_timed_out
+        assert check_timeout(req_past2) is None
+
 
 # =============================================================================
 # StepRequirement Route Selection Tests (formerly RouterRequirement)
@@ -1407,3 +1450,92 @@ class TestAsyncContinueCleanup:
 
         cleanup_sync_mock.assert_not_called()
         acleanup_mock.assert_awaited()
+
+
+
+# =============================================================================
+# HumanReview Timeout Workflow Integration Tests
+# =============================================================================
+
+
+class TestHumanReviewTimeoutWorkflowIntegration:
+    """Tests for HumanReview timeout behavior during workflow continuation."""
+
+    def test_workflow_continue_run_preserves_human_rejection_after_timeout(self):
+        from datetime import datetime, timedelta, timezone
+        from agno.db.in_memory import InMemoryDb
+        from agno.workflow.step import Step
+        from agno.workflow.types import HumanReview, OnTimeout, StepInput, StepOutput
+        from agno.workflow.workflow import Workflow
+
+        executed = []
+
+        def action(step_input: StepInput) -> StepOutput:
+            executed.append("action")
+            return StepOutput(content="done")
+
+        wf = Workflow(
+            name="test_timeout_preserves_rejection",
+            db=InMemoryDb(),
+            steps=[
+                Step(
+                    name="guarded_step",
+                    executor=action,
+                    human_review=HumanReview(
+                        requires_confirmation=True,
+                        timeout=1,
+                        on_timeout=OnTimeout.approve,
+                    ),
+                ),
+            ],
+        )
+
+        out = wf.run("go")
+        assert out.is_paused
+        req = out.steps_requiring_confirmation[0]
+        # Simulate arrival after expiration
+        req.timeout_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+        req.reject()
+
+        res = wf.continue_run(out)
+        assert executed == []
+        assert res.step_requirements[-1].confirmed is False
+
+    def test_workflow_continue_run_applies_timeout_when_unresolved(self):
+        from datetime import datetime, timedelta, timezone
+        from agno.db.in_memory import InMemoryDb
+        from agno.workflow.step import Step
+        from agno.workflow.types import HumanReview, OnTimeout, StepInput, StepOutput
+        from agno.workflow.workflow import Workflow
+
+        executed = []
+
+        def action(step_input: StepInput) -> StepOutput:
+            executed.append("action")
+            return StepOutput(content="done")
+
+        wf = Workflow(
+            name="test_timeout_applies_fallback",
+            db=InMemoryDb(),
+            steps=[
+                Step(
+                    name="guarded_step",
+                    executor=action,
+                    human_review=HumanReview(
+                        requires_confirmation=True,
+                        timeout=1,
+                        on_timeout=OnTimeout.approve,
+                    ),
+                ),
+            ],
+        )
+
+        out = wf.run("go")
+        assert out.is_paused
+        req = out.steps_requiring_confirmation[0]
+        # Simulate timeout expired without resolution
+        req.timeout_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+
+        res = wf.continue_run(out)
+        assert executed == ["action"]
+        assert res.step_requirements[-1].confirmed is True
